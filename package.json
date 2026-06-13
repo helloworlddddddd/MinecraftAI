@@ -1,0 +1,17 @@
+{
+  "name": "minecraft-ai",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
+    "mineflayer": "^4.37.1",
+    "ollama": "^0.6.3"
+  }
+}
