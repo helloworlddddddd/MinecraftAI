@@ -1,4 +1,5 @@
 const mineflayer = require('mineflayer')
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { Ollama } = require('ollama')
 
 const ollama = new Ollama()
@@ -9,207 +10,280 @@ const bot = mineflayer.createBot({
   username: 'AIBot',
   version: '1.21.1',
 })
+bot.loadPlugin(pathfinder)
 
-const THINK_INTERVAL = 15000   // 15秒ごとに思考
-const CHAT_COOLDOWN  = 30000   // 発言は30秒に1回まで
+// ========== 状態管理 ==========
+const STATE = { IDLE: 'IDLE', EXPLORE: 'EXPLORE', FIGHT: 'FIGHT', FLEE: 'FLEE', FOLLOW: 'FOLLOW', GATHER: 'GATHER' }
+let state        = STATE.IDLE
+let target       = null
+let gatherTask   = null  // { blockName, maxCount }
+let lastHealth   = 20
+let lastChatTime = 0
+let idleCounter  = 0
+let mcData       = null
 
-let isThinking    = false
-let autonomous    = true
-let lastChatTime  = 0
-let recentChat    = []         // ループ後にクリアする使い捨てバッファ
-let lastActions   = []         // 直近の自分の行動履歴（繰り返し防止）
+const FIGHT_RANGE  = 8
+const ATTACK_RANGE = 3.5
 
+// ブロック名マッピング（日本語 → Minecraft ID）
+const BLOCK_MAP = {
+  '木': ['oak_log','birch_log','spruce_log','jungle_log','acacia_log','dark_oak_log','mangrove_log'],
+  '原木': ['oak_log','birch_log','spruce_log','jungle_log','acacia_log','dark_oak_log','mangrove_log'],
+  '石': ['stone','cobblestone'],
+  '砂': ['sand'],
+  '土': ['dirt','grass_block'],
+  '石炭': ['coal_ore','deepslate_coal_ore'],
+  '鉄': ['iron_ore','deepslate_iron_ore'],
+}
+
+// ========== 起動 ==========
 bot.once('spawn', () => {
-  console.log('自律ボット起動')
+  lastHealth = bot.health
+  mcData = require('minecraft-data')(bot.version)
+  const movements = new Movements(bot)
+  bot.pathfinder.setMovements(movements)
+  console.log('起動')
   bot.chat('起動しました。')
-  setInterval(autonomousLoop, THINK_INTERVAL)
+  setInterval(behaviorTick, 100)
+  setInterval(cognitiveTick, 30000)
+  setInterval(idleCheck, 5000)
 })
 
-// ========== 知覚 ==========
-
-function buildContext() {
-  const pos = bot.entity.position
-
-  const nearbyPlayers = Object.values(bot.players)
-    .filter(p => p.entity && p.username !== bot.username)
-    .map(p => {
-      const dist = Math.floor(bot.entity.position.distanceTo(p.entity.position))
-      return `${p.username}（${dist}m）`
-    })
-
-  const nearbyMobs = Object.values(bot.entities)
-    .filter(e => e !== bot.entity && bot.entity.position.distanceTo(e.position) < 16)
-    .slice(0, 6)
-    .map(e => `${e.name || e.type}（${Math.floor(bot.entity.position.distanceTo(e.position))}m）`)
-
-  const chatLog = recentChat.length > 0
-    ? recentChat.map(c => `  ${c.username}: ${c.message}`).join('\n')
-    : '  なし'
-
-  const actionLog = lastActions.length > 0
-    ? lastActions.join(' → ')
-    : 'なし'
-
-  return `
-【状況】
-位置: X=${Math.floor(pos.x)} Y=${Math.floor(pos.y)} Z=${Math.floor(pos.z)}
-体力: ${Math.floor(bot.health)}/20  満腹度: ${Math.floor(bot.food)}/20
-近くのプレイヤー: ${nearbyPlayers.length > 0 ? nearbyPlayers.join(', ') : 'なし'}
-近くのモブ: ${nearbyMobs.length > 0 ? nearbyMobs.join(', ') : 'なし'}
-直近のチャット:
-${chatLog}
-自分の直近の行動: ${actionLog}
-`.trim()
-}
-
-// ========== 思考 ==========
-
-async function think(context, extra = '') {
-  const canChat = (Date.now() - lastChatTime) >= CHAT_COOLDOWN
-
-  const prompt = `MinecraftのAI。次の行動をJSON1行で出力せよ。繰り返し禁止。CHAT=${canChat ? 'OK' : 'NG'}。
-
-${context}${extra ? `\n追加: ${extra}` : ''}
-
-{"action":"CHAT","message":"..."} or {"action":"MOVE","reason":"..."} or {"action":"IDLE","thought":"..."}`
-
-  const response = await ollama.chat({
-    model: 'qwen2.5:7b',
-    messages: [{ role: 'user', content: prompt }],
-  })
-
-  const text = response.message.content.trim()
-  console.log('AI思考:', text)
-
-  try {
-    const match = text.match(/\{[\s\S]*?\}/)
-    if (match) {
-      const parsed = JSON.parse(match[0])
-      // クールダウン中にCHATを選んでしまった場合はIDLEに差し替え
-      if (parsed.action === 'CHAT' && !canChat) {
-        return { action: 'IDLE', thought: 'クールダウン中のため待機' }
-      }
-      return parsed
-    }
-  } catch (e) {
-    console.error('JSON解析失敗:', text)
-  }
-
-  return { action: 'IDLE', thought: '判断不能' }
-}
-
-// ========== 行動 ==========
-
-async function executeAction(action) {
-  console.log('行動:', JSON.stringify(action))
-
-  switch (action.action) {
-    case 'CHAT':
-      if (action.message) {
-        bot.chat(action.message)
-        lastChatTime = Date.now()
-        addActionLog(`CHAT: ${action.message.substring(0, 20)}`)
-      }
-      break
-
-    case 'MOVE':
-      bot.entity.yaw = Math.random() * Math.PI * 2
-      bot.setControlState('forward', true)
-      await sleep(1500 + Math.random() * 2000)
-      bot.setControlState('forward', false)
-      addActionLog('MOVE')
-      break
-
-    case 'IDLE':
-      if (action.thought) console.log('待機:', action.thought)
-      addActionLog('IDLE')
-      break
-  }
-}
-
-function addActionLog(label) {
-  lastActions.push(label)
-  if (lastActions.length > 4) lastActions.shift()
-}
-
-// ========== 自律ループ ==========
-
-async function autonomousLoop() {
-  if (!autonomous || isThinking) return
-  isThinking = true
-  try {
-    const context = buildContext()
-    const action = await think(context)
-    await executeAction(action)
-  } catch (e) {
-    console.error('ループエラー:', e.message)
-  } finally {
-    recentChat = []   // 処理済みチャットをクリア
-    isThinking = false
-  }
-}
-
-// ========== イベント対応 ==========
-
-bot.on('entityHurt', (entity) => {
-  if (entity !== bot.entity || isThinking) return
-  isThinking = true
-  const context = buildContext()
-  think(context, '攻撃を受けた！').then(executeAction).catch(console.error).finally(() => {
-    recentChat = []
-    isThinking = false
-  })
-})
+// ========== 反射層 ==========
 
 bot.on('health', () => {
-  if (bot.health < 6 && !isThinking) {
-    isThinking = true
-    const context = buildContext()
-    think(context, `体力が危険（${Math.floor(bot.health)}/20）`).then(executeAction).catch(console.error).finally(() => {
-      recentChat = []
-      isThinking = false
-    })
+  if (bot.health < lastHealth) {
+    console.log(`体力減少: ${lastHealth} → ${bot.health}`)
+    if (bot.health <= 4) {
+      setState(STATE.FLEE)
+    } else if (state !== STATE.FIGHT) {
+      const nearest = getNearestPlayer()
+      if (nearest) { target = nearest; setState(STATE.FIGHT) }
+    }
   }
+  if (state === STATE.FLEE && bot.health > 10) setState(STATE.IDLE)
+  lastHealth = bot.health
 })
 
-let lastGreeted = {}
-bot.on('entitySpawn', (entity) => {
-  if (entity.type !== 'player') return
-  const username = entity.username
-  if (!username || username === bot.username) return
-  const now = Date.now()
-  if (lastGreeted[username] && now - lastGreeted[username] < 60000) return
-  lastGreeted[username] = now
-  if (isThinking) return
-  isThinking = true
-  const context = buildContext()
-  think(context, `${username} が近くに現れた`).then(executeAction).catch(console.error).finally(() => {
-    recentChat = []
-    isThinking = false
-  })
-})
+// ========== 行動層（100ms） ==========
 
-// ========== チャット受信 ==========
+function behaviorTick() {
+  if (state === STATE.FOLLOW) { followTick(); return }
+  if (state === STATE.GATHER) return  // GATHERは非同期で別管理
+
+  if (state === STATE.IDLE || state === STATE.EXPLORE) {
+    const nearest = getNearestPlayer()
+    if (nearest?.entity) {
+      const dist = bot.entity.position.distanceTo(nearest.entity.position)
+      if (dist < FIGHT_RANGE) { target = nearest; setState(STATE.FIGHT); return }
+    }
+  }
+
+  switch (state) {
+    case STATE.IDLE:    bot.clearControlStates(); break
+    case STATE.FIGHT:   fightTick(); break
+    case STATE.FLEE:    fleeTick(); break
+    case STATE.EXPLORE: break
+  }
+}
+
+function fightTick() {
+  const nearest = getNearestPlayer()
+  if (!nearest?.entity) { setState(STATE.IDLE); return }
+  target = nearest
+  const dist = bot.entity.position.distanceTo(target.entity.position)
+  bot.lookAt(target.entity.position.offset(0, 1.6, 0))
+  if (dist < ATTACK_RANGE) {
+    bot.clearControlStates()
+    bot.attack(target.entity)
+  } else {
+    bot.setControlState('forward', true)
+    bot.setControlState('sprint', true)
+  }
+  if (dist > 20) setState(STATE.IDLE)
+}
+
+function followTick() {
+  const nearest = getNearestPlayer()
+  if (!nearest?.entity) { setState(STATE.IDLE); return }
+  const dist = bot.entity.position.distanceTo(nearest.entity.position)
+  bot.lookAt(nearest.entity.position.offset(0, 1.6, 0))
+  if (dist > 3) {
+    bot.setControlState('forward', true)
+    bot.setControlState('sprint', dist > 8)
+  } else {
+    bot.clearControlStates()
+  }
+}
+
+function fleeTick() {
+  const nearest = getNearestPlayer()
+  if (!nearest?.entity) { bot.clearControlStates(); return }
+  const away = bot.entity.position.minus(nearest.entity.position)
+  bot.entity.yaw = Math.atan2(-away.x, -away.z)
+  bot.setControlState('forward', true)
+  bot.setControlState('sprint', true)
+}
+
+// ========== 採掘タスク ==========
+
+async function runGatherTask(blockNames, maxCount) {
+  setState(STATE.GATHER)
+  bot.chat(`${blockNames[0]}を集めます。`)
+  let collected = 0
+
+  while (state === STATE.GATHER && collected < maxCount) {
+    // 最寄りのブロックを探す
+    const blockIds = blockNames
+      .map(n => mcData.blocksByName[n]?.id)
+      .filter(Boolean)
+
+    const block = bot.findBlock({
+      matching: blockIds,
+      maxDistance: 64,
+    })
+
+    if (!block) {
+      bot.chat('近くに見つかりませんでした。')
+      break
+    }
+
+    try {
+      await bot.pathfinder.goto(new goals.GoalBlock(block.position.x, block.position.y, block.position.z))
+      await bot.dig(block)
+      collected++
+      console.log(`採掘: ${block.name} (${collected}/${maxCount})`)
+    } catch (e) {
+      console.error('採掘エラー:', e.message)
+      break
+    }
+  }
+
+  bot.chat(`完了しました。（${collected}個）`)
+  setState(STATE.IDLE)
+}
+
+// ========== アイドル→探索 ==========
+
+function idleCheck() {
+  if (state !== STATE.IDLE) { idleCounter = 0; return }
+  idleCounter++
+  if (idleCounter >= 4) {
+    idleCounter = 0
+    setState(STATE.EXPLORE)
+    bot.entity.yaw = Math.random() * Math.PI * 2
+    bot.setControlState('forward', true)
+    setTimeout(() => {
+      if (state === STATE.EXPLORE) {
+        bot.setControlState('forward', false)
+        setState(STATE.IDLE)
+      }
+    }, 3000 + Math.random() * 3000)
+  }
+}
+
+// ========== 認知層（LLM・30秒） ==========
+
+async function cognitiveTick() {
+  if (state === STATE.FIGHT || state === STATE.FLEE || state === STATE.GATHER) return
+  if (Date.now() - lastChatTime < 30000) return
+  try {
+    const res = await ollama.chat({
+      model: 'qwen2.5:7b',
+      messages: [{ role: 'user', content: `MinecraftのAI。状況を見て一言だけ日本語で自然に発言せよ。短く。\n${buildContext()}` }],
+    })
+    const msg = res.message.content.trim().substring(0, 100)
+    if (msg) { bot.chat(msg); lastChatTime = Date.now() }
+  } catch (e) {
+    console.error('LLMエラー:', e.message)
+  }
+}
+
+// ========== チャット受信・LLM解釈 ==========
 
 bot.on('chat', (username, message) => {
   if (username === bot.username) return
-
-  if (message === '!停止') { autonomous = false; bot.chat('停止します。'); return }
-  if (message === '!再開') { autonomous = true;  bot.chat('再開します。'); return }
-  if (message === '!どこ') {
-    const p = bot.entity.position
-    bot.chat(`X=${Math.floor(p.x)} Y=${Math.floor(p.y)} Z=${Math.floor(p.z)}`)
-    return
-  }
-
-  // 通常発言はバッファに積むだけ（ループで消費）
-  recentChat.push({ username, message })
-  if (recentChat.length > 5) recentChat.shift()
+  interpretAndAct(username, message)
 })
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+async function interpretAndAct(username, message) {
+  try {
+    const blockList = Object.keys(BLOCK_MAP).join('・')
+    const res = await ollama.chat({
+      model: 'qwen2.5:7b',
+      messages: [{
+        role: 'user',
+        content: `MinecraftのAIボット。プレイヤーの発言の意図を読み取りJSONで1行だけ答えよ。
+
+発言者: ${username}  発言:「${message}」  現在の状態: ${state}
+
+選択肢:
+{"intent":"FIGHT"} // 戦え・攻撃・かかってこい
+{"intent":"FOLLOW"} // ついてこい・ついてくる
+{"intent":"FLEE"} // 逃げろ・下がれ・離れろ
+{"intent":"IDLE"} // 止まれ・やめろ・休め
+{"intent":"GATHER","block":"木","count":10} // ～を集めろ・採掘・取ってこい（block=${blockList}、countは個数。指定なければ10）
+{"intent":"CHAT","message":"返答"} // 質問・雑談・その他
+
+JSONのみ出力:`
+      }],
+    })
+
+    const text = res.message.content.trim()
+    const match = text.match(/\{[\s\S]*?\}/)
+    if (!match) return
+    const parsed = JSON.parse(match[0])
+    console.log(`解釈 [${username}: ${message}] →`, parsed)
+
+    switch (parsed.intent) {
+      case 'FIGHT':
+        target = getNearestPlayer(); setState(STATE.FIGHT); break
+      case 'FOLLOW':
+        setState(STATE.FOLLOW); break
+      case 'FLEE':
+        setState(STATE.FLEE); break
+      case 'IDLE':
+        setState(STATE.IDLE); bot.chat('わかった。'); break
+      case 'GATHER': {
+        const blockNames = BLOCK_MAP[parsed.block] ?? BLOCK_MAP['木']
+        const count = parseInt(parsed.count) || 10
+        runGatherTask(blockNames, count)
+        break
+      }
+      case 'CHAT':
+        if (parsed.message) { bot.chat(parsed.message); lastChatTime = Date.now() }
+        break
+    }
+  } catch (e) {
+    console.error('解釈エラー:', e.message)
+  }
 }
 
-bot.on('error', err => console.error('エラー:', err))
+// ========== ユーティリティ ==========
+
+function setState(newState) {
+  if (state === newState) return
+  console.log(`状態: ${state} → ${newState}`)
+  state = newState
+  if (newState !== STATE.FIGHT && newState !== STATE.FLEE) bot.clearControlStates()
+}
+
+function getNearestPlayer() {
+  return Object.values(bot.players)
+    .filter(p => p.entity && p.username !== bot.username)
+    .sort((a, b) =>
+      bot.entity.position.distanceTo(a.entity.position) -
+      bot.entity.position.distanceTo(b.entity.position)
+    )[0] ?? null
+}
+
+function buildContext() {
+  const pos = bot.entity.position
+  const players = Object.values(bot.players)
+    .filter(p => p.entity && p.username !== bot.username)
+    .map(p => `${p.username}(${Math.floor(bot.entity.position.distanceTo(p.entity.position))}m)`)
+  return `状態:${state} 体力:${Math.floor(bot.health)}/20 位置:${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)} プレイヤー:${players.join(',') || 'なし'}`
+}
+
+bot.on('error',  err    => console.error('エラー:', err))
 bot.on('kicked', reason => console.log('キック:', reason))
